@@ -1,0 +1,4 @@
+# /etc/fsubid.conf
+# Default range sizes when flags are not provided.
+UID_RANGE=70000
+GID_RANGE=70000
