@@ -7,6 +7,8 @@
  *   - Release reservation without commit.
  *   - Validate and inspect ranges.
  *   - Track reservation state (reserved/committed/released/expired).
+ *   - Audit committed ranges for overlaps, gaps, and uid/gid asymmetry.
+ *   - Reclaim ranges of deleted users and garbage-collect stale state.
  */
 
 #ifndef _GNU_SOURCE
@@ -24,10 +26,11 @@
 #include <time.h>
 #include <errno.h>
 #include <limits.h>
+#include <pwd.h>
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
-#define FSUBID_VERSION          "1.0.0"
+#define FSUBID_VERSION          "1.1.0"
 
 /* ---- tunables ----------------------------------------------------------- */
 #define CONF_FILE               "/etc/fsubid.conf"
@@ -62,6 +65,8 @@ enum command {
     CMD_VALIDATE,
     CMD_WHO_OWNS,
     CMD_STATUS,
+    CMD_CHECK,
+    CMD_RECLAIM,
     CMD_VERSION
 };
 
@@ -119,6 +124,8 @@ static void usage(int code)
         "  fsubid validate-range --start <N> [--uid-range <N>] [--gid-range <N>]\n"
         "  fsubid who-owns-range --start <N>\n"
         "  fsubid status --start <N>\n"
+        "  fsubid check\n"
+        "  fsubid reclaim\n"
         "  fsubid version\n"
         "\n"
         "COMMON OPTIONS:\n"
@@ -137,6 +144,10 @@ static void usage(int code)
         "  Allocate output format: START:UID_SIZE:GID_SIZE\n"
         "  Creating a range requires the explicit 'allocate' command;\n"
         "  a bare username does nothing and will not allocate.\n"
+        "  'check' audits /etc/subuid and /etc/subgid for overlaps, gaps,\n"
+        "  dead owners, and uid/gid asymmetry (exit 13 if issues found).\n"
+        "  'reclaim' removes committed ranges of deleted users and\n"
+        "  garbage-collects stale reservation/state files.\n"
         "\n"
         "EXIT CODES:\n"
         "  0  success\n"
@@ -880,6 +891,347 @@ static int command_commit(long start, const char *target_user)
     return EX_OK;
 }
 
+/* ---- check / reclaim ----------------------------------------------------- */
+
+struct entry {
+    char owner[128];
+    long start;
+    long count;
+};
+
+struct entries {
+    struct entry *items;
+    size_t len;
+    size_t cap;
+};
+
+static int entries_push(struct entries *e, const char *owner, long start, long count)
+{
+    if (e->len == e->cap) {
+        size_t next = e->cap == 0 ? 16 : e->cap * 2;
+        void *p = realloc(e->items, next * sizeof(*e->items));
+        if (!p) return 0;
+        e->items = p;
+        e->cap = next;
+    }
+    snprintf(e->items[e->len].owner, sizeof(e->items[e->len].owner), "%s", owner);
+    e->items[e->len].start = start;
+    e->items[e->len].count = count;
+    e->len++;
+    return 1;
+}
+
+static void entries_free(struct entries *e)
+{
+    free(e->items);
+    e->items = NULL;
+    e->len = 0;
+    e->cap = 0;
+}
+
+static int entries_from_file(const char *path, struct entries *out)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        if (errno == ENOENT) return 1;
+        return 0;
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char owner[128];
+        long start = 0;
+        long count = 0;
+        if (!parse_triplet_line(line, owner, sizeof(owner), &start, &count))
+            continue;
+        if (!entries_push(out, owner, start, count)) {
+            fclose(f);
+            return 0;
+        }
+    }
+
+    fclose(f);
+    return 1;
+}
+
+/*
+ * An owner is "live" if it resolves in the passwd database, either by
+ * name or (for numeric entries, which sub{u,g}id files permit) by uid.
+ */
+static int owner_exists(const char *owner)
+{
+    if (getpwnam(owner))
+        return 1;
+    if (is_digits(owner)) {
+        errno = 0;
+        long uid = strtol(owner, NULL, 10);
+        if (errno == 0 && uid >= 0 && getpwuid((uid_t)uid))
+            return 1;
+    }
+    return 0;
+}
+
+static const struct entry *entries_find(const struct entries *e, const char *owner)
+{
+    for (size_t i = 0; i < e->len; i++) {
+        if (strcmp(e->items[i].owner, owner) == 0)
+            return &e->items[i];
+    }
+    return NULL;
+}
+
+static int cmp_entry_start(const void *a, const void *b)
+{
+    const struct entry *ea = a;
+    const struct entry *eb = b;
+    if (ea->start < eb->start) return -1;
+    if (ea->start > eb->start) return 1;
+    return 0;
+}
+
+/*
+ * Audit one file for pairwise overlaps and dead owners.
+ * Returns the number of issues found (prints one line per issue).
+ */
+static int check_file(const char *label, const struct entries *e)
+{
+    int issues = 0;
+
+    for (size_t i = 0; i < e->len; i++) {
+        for (size_t j = i + 1; j < e->len; j++) {
+            if (range_overlaps(e->items[i].start, e->items[i].count,
+                               e->items[j].start, e->items[j].count)) {
+                printf("overlap %s: %s:%ld:%ld <-> %s:%ld:%ld\n",
+                       label,
+                       e->items[i].owner, e->items[i].start, e->items[i].count,
+                       e->items[j].owner, e->items[j].start, e->items[j].count);
+                issues++;
+            }
+        }
+        if (!owner_exists(e->items[i].owner)) {
+            printf("dead-owner %s: %s:%ld:%ld (user not in passwd)\n",
+                   label,
+                   e->items[i].owner, e->items[i].start, e->items[i].count);
+            issues++;
+        }
+    }
+
+    return issues;
+}
+
+/* Print gaps between consecutive committed ranges (informational only). */
+static void report_gaps(const char *label, const struct entries *src)
+{
+    if (src->len < 2)
+        return;
+
+    struct entries sorted = {0};
+    for (size_t i = 0; i < src->len; i++) {
+        if (!entries_push(&sorted, src->items[i].owner,
+                          src->items[i].start, src->items[i].count)) {
+            entries_free(&sorted);
+            return;
+        }
+    }
+    qsort(sorted.items, sorted.len, sizeof(*sorted.items), cmp_entry_start);
+
+    for (size_t i = 0; i + 1 < sorted.len; i++) {
+        long end = sorted.items[i].start + sorted.items[i].count;
+        long next = sorted.items[i + 1].start;
+        if (next > end) {
+            printf("gap %s: %ld..%ld (%ld ids reclaimable)\n",
+                   label, end, next - 1, next - end);
+        }
+    }
+
+    entries_free(&sorted);
+}
+
+static int command_check(void)
+{
+    struct entries uid_entries = {0};
+    struct entries gid_entries = {0};
+    int issues = 0;
+
+    if (!entries_from_file(SUBUID_FILE, &uid_entries) ||
+        !entries_from_file(SUBGID_FILE, &gid_entries)) {
+        entries_free(&uid_entries);
+        entries_free(&gid_entries);
+        diec(EX_IO, "cannot read subid files");
+    }
+
+    issues += check_file("subuid", &uid_entries);
+    issues += check_file("subgid", &gid_entries);
+
+    /* Asymmetry: every owner should appear in both files. */
+    for (size_t i = 0; i < uid_entries.len; i++) {
+        if (!entries_find(&gid_entries, uid_entries.items[i].owner)) {
+            printf("asymmetry: %s has subuid %ld:%ld but no subgid entry\n",
+                   uid_entries.items[i].owner,
+                   uid_entries.items[i].start, uid_entries.items[i].count);
+            issues++;
+        }
+    }
+    for (size_t i = 0; i < gid_entries.len; i++) {
+        if (!entries_find(&uid_entries, gid_entries.items[i].owner)) {
+            printf("asymmetry: %s has subgid %ld:%ld but no subuid entry\n",
+                   gid_entries.items[i].owner,
+                   gid_entries.items[i].start, gid_entries.items[i].count);
+            issues++;
+        }
+    }
+
+    report_gaps("subuid", &uid_entries);
+    report_gaps("subgid", &gid_entries);
+
+    entries_free(&uid_entries);
+    entries_free(&gid_entries);
+
+    if (issues > 0) {
+        printf("check: %d issue(s) found\n", issues);
+        return EX_OVERLAP;
+    }
+
+    printf("check: ok\n");
+    return EX_OK;
+}
+
+/*
+ * Rewrite `path`, dropping parseable entries whose owner no longer exists.
+ * Non-entry lines (comments, blanks) are preserved verbatim.
+ * Returns the number of entries removed, or -1 on error. Caller holds the lock.
+ */
+static int rewrite_file_dropping_dead(const char *path, struct entries *removed)
+{
+    FILE *in = fopen(path, "r");
+    if (!in) {
+        if (errno == ENOENT) return 0;
+        return -1;
+    }
+
+    char tmp_path[PATH_MAX];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.fsubid.tmp", path);
+
+    int tmp_fd = open(tmp_path, O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (tmp_fd < 0) {
+        fclose(in);
+        return -1;
+    }
+    FILE *out = fdopen(tmp_fd, "w");
+    if (!out) {
+        close(tmp_fd);
+        unlink(tmp_path);
+        fclose(in);
+        return -1;
+    }
+
+    int dropped = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), in)) {
+        char owner[128];
+        long start = 0;
+        long count = 0;
+
+        if (parse_triplet_line(line, owner, sizeof(owner), &start, &count) &&
+            !owner_exists(owner)) {
+            if (removed)
+                (void)entries_push(removed, owner, start, count);
+            dropped++;
+            continue;
+        }
+        fputs(line, out);
+    }
+    fclose(in);
+
+    if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
+        fclose(out);
+        unlink(tmp_path);
+        return -1;
+    }
+    fclose(out);
+
+    if (dropped == 0) {
+        unlink(tmp_path);
+        return 0;
+    }
+
+    if (rename(tmp_path, path) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+    return dropped;
+}
+
+/*
+ * Remove state files that no longer describe anything live:
+ * "released"/"expired" markers, and "committed" markers whose range
+ * is no longer present in the subid files.
+ */
+static int gc_state_files(void)
+{
+    DIR *d = opendir(STATE_DIR);
+    if (!d) return 0;
+
+    int removed = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.' || !is_digits(ent->d_name))
+            continue;
+
+        long start = strtol(ent->d_name, NULL, 10);
+        char st[64];
+        if (!read_state(start, st, sizeof(st)))
+            continue;
+
+        int stale = 0;
+        if (strcmp(st, "released") == 0 || strcmp(st, "expired") == 0)
+            stale = 1;
+        else if (strcmp(st, "committed") == 0 && !range_committed(start, 1, 1))
+            stale = 1;
+
+        if (stale) {
+            char path[PATH_MAX];
+            state_file_path(start, path, sizeof(path));
+            if (unlink(path) == 0)
+                removed++;
+        }
+    }
+    closedir(d);
+    return removed;
+}
+
+static int command_reclaim(void)
+{
+    struct entries removed = {0};
+
+    int lock_fd = open_global_lock();
+    if (lock_fd < 0)
+        diec(EX_LOCK, "cannot acquire lock");
+
+    int dropped_uid = rewrite_file_dropping_dead(SUBUID_FILE, &removed);
+    int dropped_gid = rewrite_file_dropping_dead(SUBGID_FILE, &removed);
+    if (dropped_uid < 0 || dropped_gid < 0) {
+        entries_free(&removed);
+        close_global_lock(lock_fd);
+        diec(EX_IO, "failed to rewrite subid files");
+    }
+
+    /* gc_stale_reservations() already ran at startup; sweep state files too. */
+    int state_removed = gc_state_files();
+
+    close_global_lock(lock_fd);
+
+    for (size_t i = 0; i < removed.len; i++)
+        printf("reclaimed: %s:%ld:%ld\n",
+               removed.items[i].owner, removed.items[i].start,
+               removed.items[i].count);
+    entries_free(&removed);
+
+    printf("reclaim: %d subuid + %d subgid entrie(s) removed, %d stale state file(s) cleaned\n",
+           dropped_uid, dropped_gid, state_removed);
+    return EX_OK;
+}
+
 int main(int argc, char *argv[])
 {
     long cfg_uid_range = DEFAULT_UID_RANGE;
@@ -923,6 +1275,14 @@ int main(int argc, char *argv[])
             argc--;
         } else if (strcmp(argv[1], "status") == 0) {
             cmd = CMD_STATUS;
+            argv++;
+            argc--;
+        } else if (strcmp(argv[1], "check") == 0) {
+            cmd = CMD_CHECK;
+            argv++;
+            argc--;
+        } else if (strcmp(argv[1], "reclaim") == 0) {
+            cmd = CMD_RECLAIM;
             argv++;
             argc--;
         } else if (strcmp(argv[1], "version") == 0) {
@@ -1015,6 +1375,10 @@ int main(int argc, char *argv[])
         if (start <= 0)
             diec(EX_USAGE, "status requires --start <N>");
         return command_status(start);
+    case CMD_CHECK:
+        return command_check();
+    case CMD_RECLAIM:
+        return command_reclaim();
     case CMD_VERSION:
         return command_version();
     case CMD_NONE:

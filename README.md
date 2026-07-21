@@ -41,8 +41,10 @@ This implementation includes the full solution scope:
 5. `validate-range`: verifies whether a candidate range is currently valid.
 6. `who-owns-range`: shows owners overlapping a given id.
 7. `status`: reports reservation/range state.
-8. `version`: prints the program version.
-9. Automatic stale reservation garbage collection by TTL.
+8. `check`: audits `/etc/subuid` and `/etc/subgid` for overlaps, dead owners, uid/gid asymmetry, and gaps.
+9. `reclaim`: removes committed ranges of deleted users and garbage-collects stale reservation/state files.
+10. `version`: prints the program version.
+11. Automatic stale reservation garbage collection by TTL.
 
 ## Build
 
@@ -118,6 +120,19 @@ Check state:
 sudo fsubid status --start START
 ```
 
+Audit the subid files for overlaps, dead owners, asymmetry, and gaps:
+
+```sh
+sudo fsubid check
+# exit 0 = clean, exit 13 = issues found (one line per issue)
+```
+
+Reclaim ranges of deleted users and clean stale state:
+
+```sh
+sudo fsubid reclaim
+```
+
 Print the version:
 
 ```sh
@@ -134,6 +149,8 @@ fsubid list-reservations
 fsubid validate-range --start <N> [--uid-range <N>] [--gid-range <N>]
 fsubid who-owns-range --start <N>
 fsubid status --start <N>
+fsubid check
+fsubid reclaim
 fsubid version
 ```
 
